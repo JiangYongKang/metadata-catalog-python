@@ -1,8 +1,8 @@
-from fastapi import FastAPI
+"""本地元数据目录服务入口。
 
-app = FastAPI()
+启动：uv run uvicorn main:app --reload
+"""
 
+from metadata_catalog.api import app
 
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]
