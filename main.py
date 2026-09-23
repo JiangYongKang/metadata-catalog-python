@@ -1,8 +1,4 @@
-from fastapi import FastAPI
+"""Service entrypoint: serves the local metadata catalog HTTP API."""
+from metadata_catalog.api import app
 
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]

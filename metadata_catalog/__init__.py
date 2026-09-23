@@ -1,0 +1,1 @@
+"""Local metadata catalog package."""
