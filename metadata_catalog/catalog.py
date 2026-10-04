@@ -2,23 +2,49 @@
 from __future__ import annotations
 
 import threading
+import uuid
 from time import time
 
+from .audit import (
+    ACTION_ADD,
+    ACTION_REMOVE,
+    AuditLog,
+)
+from .batch import (
+    BatchResult,
+    LineageOp,
+    OP_ADD,
+    is_self_dependency,
+    normalize_ops,
+    plan_batch,
+)
 from .errors import (
     AssetNotFoundError,
+    BatchRejectedError,
     ColumnNotFoundError,
     ConcurrentUpdateError,
     LineageCycleError,
+    LineageTimeError,
 )
 from .models import Asset, AssetVersion, Column, LineageEdge
+from .timeline import (
+    LineageSnapshot,
+    reconstruct_as_of,
+    reconstruct_for_asset_version,
+    validate_timestamp,
+)
 
 
 class MetadataCatalog:
-    def __init__(self) -> None:
+    def __init__(self, *, clock=None) -> None:
         self._assets: dict[str, Asset] = {}
         self._edges: set[tuple] = set()
         self._edge_objs: dict[tuple, LineageEdge] = {}
+        self._asset_born: dict[str, float] = {}
         self._lock = threading.RLock()
+        self._audit = AuditLog()
+        self._clock = clock or time
+        self._started_at = self._clock()
 
     # ---- assets -----------------------------------------------------------
     @staticmethod
@@ -78,7 +104,7 @@ class MetadataCatalog:
         incoming_cols = self._normalize_columns(columns)
         with self._lock:
             existing = self._assets.get(asset_id)
-            now = time()
+            now = self._clock()
             if existing is None:
                 if expected_version is not None and expected_version != 0:
                     raise ConcurrentUpdateError(
@@ -95,6 +121,7 @@ class MetadataCatalog:
                     columns=incoming_cols, description=description,
                     created_at=now, change_note=change_note or "initial registration"))
                 self._assets[asset_id] = asset
+                self._asset_born.setdefault(asset_id, now)
                 return asset
 
             if expected_version is not None and expected_version != existing.current_version:
@@ -214,18 +241,23 @@ class MetadataCatalog:
         Rejects:
         - AssetNotFoundError: either endpoint asset is unknown (dangling ref)
         - ColumnNotFoundError: a referenced column does not exist
-        - LineageCycleError: the edge would close a cycle; cycle path attached
-        Idempotent: re-adding the identical edge returns the stored edge.
+        - LineageCycleError: the edge would close a cycle (including a column
+          depending on itself or on its own whole asset)
+        Idempotent: re-adding the identical edge returns the stored edge and
+        still leaves an audited no-op record.
         Column-level edges never overwrite asset-level or other column edges.
         """
         upstream, downstream = str(upstream), str(downstream)
-        if upstream == downstream and not (upstream_column or downstream_column):
-            raise LineageCycleError(
-                f"self-dependency rejected: {upstream!r} -> itself",
-                asset=upstream, cycle=[upstream, upstream])
         with self._lock:
             self._validate_endpoint(upstream, upstream_column)
             self._validate_endpoint(downstream, downstream_column)
+
+            cycle = is_self_dependency(upstream, downstream,
+                                       upstream_column, downstream_column)
+            if cycle is not None:
+                raise LineageCycleError(
+                    f"self-dependency rejected: {upstream!r} -> itself",
+                    asset=upstream, cycle=list(cycle))
 
             # Would this edge make downstream reachable ... -> upstream?
             path = self._find_path(downstream, upstream)
@@ -236,25 +268,50 @@ class MetadataCatalog:
                     f"would close cycle {' -> '.join(cycle)}",
                     asset=downstream, cycle=cycle)
 
-            edge = LineageEdge(upstream, downstream, upstream_column, downstream_column)
+            edge = LineageEdge(upstream, downstream, upstream_column,
+                               downstream_column, registered_at=self._clock())
             k = edge.key()
             existing = self._edge_objs.get(k)
             if existing is not None:
+                self._audit.record(ACTION_ADD, upstream, downstream,
+                                   upstream_column, downstream_column,
+                                   before_present=True, changed=False,
+                                   timestamp=self._clock())
                 return existing
             self._edges.add(k)
             self._edge_objs[k] = edge
+            self._audit.record(ACTION_ADD, upstream, downstream,
+                               upstream_column, downstream_column,
+                               before_present=False, changed=True,
+                               timestamp=edge.registered_at)
             return edge
 
     def remove_lineage(self, upstream, downstream, upstream_column=None,
                        downstream_column=None) -> bool:
-        edge = LineageEdge(str(upstream), str(downstream), upstream_column,
+        """Remove one edge. Returns True when something was removed.
+
+        Both the effective removal and a removal attempt against a missing edge
+        are audited. Endpoint existence is not required for removal, matching
+        the legacy behavior (tombstone-style unregistering).
+        """
+        upstream, downstream = str(upstream), str(downstream)
+        edge = LineageEdge(upstream, downstream, upstream_column,
                            downstream_column)
         with self._lock:
+            now = self._clock()
             k = edge.key()
             if k in self._edge_objs:
                 del self._edge_objs[k]
                 self._edges.discard(k)
+                self._audit.record(ACTION_REMOVE, upstream, downstream,
+                                   upstream_column, downstream_column,
+                                   before_present=True, changed=True,
+                                   timestamp=now)
                 return True
+            self._audit.record(ACTION_REMOVE, upstream, downstream,
+                               upstream_column, downstream_column,
+                               before_present=False, changed=False,
+                               timestamp=now)
             return False
 
     def list_lineage(self) -> list[LineageEdge]:
@@ -275,3 +332,102 @@ class MetadataCatalog:
         with self._lock:
             return sorted({e.downstream for e in self._edge_objs.values()
                            if e.upstream == node and e.downstream != node})
+
+    # ---- audit ------------------------------------------------------------
+    @property
+    def audit_log(self) -> AuditLog:
+        return self._audit
+
+    def lineage_changes(self, asset_id, *, start=None, end=None) -> list:
+        """Chronological lineage changes touching one asset.
+
+        - Unknown asset -> AssetNotFoundError (HTTP 404).
+        - Known asset with no lineage activity -> empty list.
+        The two empty-looking situations therefore never share a response.
+        start/end are inclusive epoch-second bounds when supplied.
+        """
+        asset_id = str(asset_id)
+        if not self.asset_exists(asset_id):
+            raise AssetNotFoundError(
+                f"no lineage changes: unknown asset {asset_id!r}",
+                asset=asset_id)
+        start_ts = validate_timestamp(start, name="start") if start is not None else None
+        end_ts = validate_timestamp(end, name="end") if end is not None else None
+        if start_ts is not None and end_ts is not None and start_ts > end_ts:
+            raise LineageTimeError(
+                f"start ({start_ts}) must not be later than end ({end_ts})",
+                reason="invalid_range", requested=[start_ts, end_ts])
+        return self._audit.changes_for_asset(asset_id,
+                                             start=start_ts, end=end_ts)
+
+    def all_lineage_changes(self, *, start=None, end=None) -> list:
+        start_ts = validate_timestamp(start, name="start") if start is not None else None
+        end_ts = validate_timestamp(end, name="end") if end is not None else None
+        if start_ts is not None and end_ts is not None and start_ts > end_ts:
+            raise LineageTimeError(
+                f"start ({start_ts}) must not be later than end ({end_ts})",
+                reason="invalid_range", requested=[start_ts, end_ts])
+        return self._audit.all_changes(start=start_ts, end=end_ts)
+
+    # ---- reconstruction ---------------------------------------------------
+    def lineage_as_of(self, as_of) -> LineageSnapshot:
+        """Reconstruct the lineage graph at a past point in time."""
+        return reconstruct_as_of(self, as_of)
+
+    def lineage_at_asset_version(self, asset_id, version) -> LineageSnapshot:
+        """Reconstruct lineage as of when ``asset_id`` was at ``version``."""
+        return reconstruct_for_asset_version(self, asset_id, version)
+
+    # ---- batch commit -----------------------------------------------------
+    def commit_lineage_batch(self, ops, *, batch_id=None,
+                             change_note="") -> BatchResult:
+        """Atomically apply a batch of add/remove ops (all or nothing).
+
+        Every op is validated against a tentative view that includes earlier
+        ops of the same batch. If one or more ops reference unknown assets /
+        columns or introduce a cycle (including column-level self loops), the
+        whole batch is rejected with BatchRejectedError carrying per-op
+        failures; no edge is added or removed and nothing is audited.
+
+        Concurrent batches serialize on the catalog lock, so commits are
+        never lost and concurrent readers never observe a half-applied batch.
+        """
+        normalized = normalize_ops(ops)
+        with self._lock:
+            entries, failures = plan_batch(
+                normalized, assets=self._assets, edge_objs=self._edge_objs)
+            if failures:
+                raise BatchRejectedError(
+                    f"lineage batch rejected: {len(failures)} of "
+                    f"{len(normalized)} op(s) failed validation; nothing was "
+                    f"applied",
+                    batch_id=batch_id, failures=failures)
+
+            bid = batch_id or uuid.uuid4().hex
+            now = self._clock()
+            changes = []
+            applied: list[LineageOp] = []
+            skipped: list[int] = []
+            for entry in entries:
+                op = entry.op
+                if not entry.changed:
+                    skipped.append(entry.index)
+                    continue
+                if op.action == OP_ADD:
+                    self._edges.add(entry.key)
+                    self._edge_objs[entry.key] = LineageEdge(
+                        op.upstream, op.downstream, op.upstream_column,
+                        op.downstream_column, registered_at=now)
+                else:
+                    self._edges.discard(entry.key)
+                    self._edge_objs.pop(entry.key, None)
+                change = self._audit.record(
+                    op.action, op.upstream, op.downstream,
+                    op.upstream_column, op.downstream_column,
+                    before_present=entry.before_present, changed=True,
+                    timestamp=now, batch_id=bid, change_note=change_note)
+                changes.append(change)
+                applied.append(op)
+            return BatchResult(batch_id=bid, committed=True,
+                               applied=tuple(applied), changes=tuple(changes),
+                               skipped=tuple(skipped))

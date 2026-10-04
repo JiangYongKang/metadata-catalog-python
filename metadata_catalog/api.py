@@ -8,10 +8,12 @@ from pydantic import BaseModel, Field
 from .catalog import MetadataCatalog
 from .errors import (
     AssetNotFoundError,
+    BatchRejectedError,
     CatalogError,
     ColumnNotFoundError,
     ConcurrentUpdateError,
     LineageCycleError,
+    LineageTimeError,
 )
 from .impact import analyze_impact
 
@@ -39,6 +41,20 @@ class LineageIn(BaseModel):
     downstream_column: str | None = None
 
 
+class LineageOpIn(BaseModel):
+    action: str
+    upstream: str
+    downstream: str
+    upstream_column: str | None = None
+    downstream_column: str | None = None
+
+
+class LineageBatchIn(BaseModel):
+    ops: list[LineageOpIn]
+    batch_id: str | None = None
+    change_note: str = ""
+
+
 def _asset_dict(asset) -> dict:
     return {
         "asset_id": asset.id,
@@ -64,6 +80,8 @@ def create_app(catalog: MetadataCatalog | None = None) -> FastAPI:
             ColumnNotFoundError: 404,
             LineageCycleError: 422,
             ConcurrentUpdateError: 409,
+            LineageTimeError: 400,
+            BatchRejectedError: 422,
         }.get(type(exc), 400)
         return JSONResponse(status_code=status,
                             content={"error": exc.to_dict()})
@@ -119,6 +137,86 @@ def create_app(catalog: MetadataCatalog | None = None) -> FastAPI:
             "downstream_column": e.downstream_column,
             "column_level": e.is_column_level,
         } for e in app.state.catalog.list_lineage()]
+
+    # ---- audit ------------------------------------------------------------
+    def _change_dict(c):
+        d = c.to_dict()
+        d["column_level"] = bool(d["upstream_column"] or d["downstream_column"])
+        return d
+
+    @app.get("/lineage/changes")
+    def list_all_lineage_changes(start: float | None = None,
+                                 end: float | None = None):
+        """Global lineage audit trail, optionally time-bounded (inclusive)."""
+        return [_change_dict(c)
+                for c in app.state.catalog.all_lineage_changes(start=start,
+                                                                end=end)]
+
+    @app.get("/assets/{asset_id}/lineage-changes")
+    def asset_lineage_changes(asset_id: str, start: float | None = None,
+                              end: float | None = None):
+        """Per-asset audit trail. 404 unknown asset; [] known but no changes."""
+        return [_change_dict(c)
+                for c in app.state.catalog.lineage_changes(asset_id,
+                                                           start=start, end=end)]
+
+    # ---- point-in-time reconstruction ------------------------------------
+    def _snapshot_dict(snapshot):
+        return {
+            "as_of": snapshot.as_of,
+            "nodes": sorted(snapshot.nodes),
+            "edges": [{
+                "upstream": e.upstream, "downstream": e.downstream,
+                "upstream_column": e.upstream_column,
+                "downstream_column": e.downstream_column,
+                "column_level": e.is_column_level,
+                "registered_at": e.registered_at,
+            } for e in snapshot.list_edges()],
+        }
+
+    @app.get("/lineage/as-of")
+    def lineage_as_of(as_of: float):
+        return _snapshot_dict(app.state.catalog.lineage_as_of(as_of))
+
+    @app.get("/assets/{asset_id}/lineage-at-version/{version}")
+    def lineage_at_version(asset_id: str, version: int):
+        return _snapshot_dict(
+            app.state.catalog.lineage_at_asset_version(asset_id, version))
+
+    @app.get("/impact/as-of/{asset_id}")
+    def impact_as_of(asset_id: str, as_of: float,
+                     direction: str = "downstream",
+                     max_depth: int | None = None):
+        """Impact analysis on the graph reconstructed at ``as_of``."""
+        snapshot = app.state.catalog.lineage_as_of(as_of)
+        return analyze_impact(snapshot, asset_id, direction=direction,
+                              max_depth=max_depth).to_dict()
+
+    @app.get("/impact/at-version/{asset_id}/{version}")
+    def impact_at_version(asset_id: str, version: int,
+                          start: str | None = None,
+                          direction: str = "downstream",
+                          max_depth: int | None = None):
+        """Impact analysis on the graph as of an asset's historical version.
+        ``start`` selects the impact root (defaults to the versioned asset)."""
+        snapshot = app.state.catalog.lineage_at_asset_version(asset_id, version)
+        return analyze_impact(snapshot, start or asset_id,
+                              direction=direction,
+                              max_depth=max_depth).to_dict()
+
+    # ---- batch commit -----------------------------------------------------
+    @app.post("/lineage/batch")
+    def commit_lineage_batch(payload: LineageBatchIn):
+        try:
+            result = app.state.catalog.commit_lineage_batch(
+                [op.model_dump() for op in payload.ops],
+                batch_id=payload.batch_id,
+                change_note=payload.change_note)
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"code": "invalid_batch", "message": str(exc)}})
+        return result.to_dict()
 
     @app.get("/impact/{asset_id}")
     def impact(asset_id: str, direction: str = "downstream",

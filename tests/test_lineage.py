@@ -106,6 +106,21 @@ class LineageValidationTest(unittest.TestCase):
         self.assertEqual(before, after,
                          f"reason: rejected edge mutated graph ({before} -> {after})")
 
+    def test_column_level_self_loop_rejected_on_single_api(self):
+        """A column depending on itself (or on its own whole asset) is a cycle."""
+        log_case("column self loop via single API", edge=("a.id", "a.id"))
+        with self.assertRaises(LineageCycleError) as ctx:
+            self.catalog.add_lineage("a", "a", "id", "id")
+        self.assertEqual(ctx.exception.code, "lineage_cycle")
+        # whole-asset <-> own column also closes on itself
+        with self.assertRaises(LineageCycleError):
+            self.catalog.add_lineage("a", "a", None, "id")
+        # but a genuine column transformation within an asset is allowed
+        edge = self.catalog.add_lineage("a", "a", "id", "v")
+        self.assertEqual((edge.upstream_column, edge.downstream_column),
+                         ("id", "v"))
+        self.assertEqual(len(self.catalog.list_lineage()), 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
