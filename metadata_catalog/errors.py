@@ -1,6 +1,8 @@
 """Catalog errors carrying stable, distinguishable machine-readable codes."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 
 class CatalogError(Exception):
     code = "catalog_error"
@@ -63,4 +65,79 @@ class ConcurrentUpdateError(CatalogError):
             data["expected_version"] = self.expected_version
         if self.actual_version is not None:
             data["actual_version"] = self.actual_version
+        return data
+
+
+class InvalidTimePointError(CatalogError):
+    """The as-of time parameter itself is not a legal point in time."""
+    code = "invalid_time_point"
+
+    def __init__(self, message: str = "", *, value=None):
+        super().__init__(message)
+        self.value = value
+
+    def to_dict(self) -> dict:
+        data = super().to_dict()
+        data["value"] = self.value
+        return data
+
+
+class TimePointOutOfRangeError(CatalogError):
+    """The time is well-formed but cannot be reconstructed: it lies outside
+    the audited lineage history window."""
+    code = "time_point_out_of_range"
+
+    def __init__(self, message: str = "", *, requested=None,
+                 earliest: float | None = None, latest: float | None = None):
+        super().__init__(message)
+        self.requested = requested
+        self.earliest = earliest
+        self.latest = latest
+
+    def to_dict(self) -> dict:
+        data = super().to_dict()
+        data["requested"] = self.requested
+        if self.earliest is not None:
+            data["earliest"] = self.earliest
+        if self.latest is not None:
+            data["latest"] = self.latest
+        return data
+
+
+@dataclass(frozen=True)
+class BatchFailure:
+    """One rejected item inside a batch lineage change."""
+    index: int
+    code: str
+    message: str
+    upstream: str
+    downstream: str
+    upstream_column: str | None = None
+    downstream_column: str | None = None
+    operation: str = "add"
+
+    def to_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "operation": self.operation,
+            "code": self.code,
+            "message": self.message,
+            "upstream": self.upstream,
+            "downstream": self.downstream,
+            "upstream_column": self.upstream_column,
+            "downstream_column": self.downstream_column,
+        }
+
+
+class BatchLineageError(CatalogError):
+    """A batch change was rejected as a whole; every offending item is listed."""
+    code = "batch_lineage_rejected"
+
+    def __init__(self, message: str = "", *, failures: list[BatchFailure] | None = None):
+        super().__init__(message)
+        self.failures = failures or []
+
+    def to_dict(self) -> dict:
+        data = super().to_dict()
+        data["failures"] = [f.to_dict() for f in self.failures]
         return data

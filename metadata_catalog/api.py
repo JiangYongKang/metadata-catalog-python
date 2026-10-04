@@ -8,10 +8,13 @@ from pydantic import BaseModel, Field
 from .catalog import MetadataCatalog
 from .errors import (
     AssetNotFoundError,
+    BatchLineageError,
     CatalogError,
     ColumnNotFoundError,
     ConcurrentUpdateError,
+    InvalidTimePointError,
     LineageCycleError,
+    TimePointOutOfRangeError,
 )
 from .impact import analyze_impact
 
@@ -39,6 +42,18 @@ class LineageIn(BaseModel):
     downstream_column: str | None = None
 
 
+class BatchLineageItemIn(BaseModel):
+    op: str = "add"
+    upstream: str
+    downstream: str
+    upstream_column: str | None = None
+    downstream_column: str | None = None
+
+
+class BatchLineageIn(BaseModel):
+    changes: list[BatchLineageItemIn]
+
+
 def _asset_dict(asset) -> dict:
     return {
         "asset_id": asset.id,
@@ -64,6 +79,9 @@ def create_app(catalog: MetadataCatalog | None = None) -> FastAPI:
             ColumnNotFoundError: 404,
             LineageCycleError: 422,
             ConcurrentUpdateError: 409,
+            InvalidTimePointError: 400,
+            TimePointOutOfRangeError: 422,
+            BatchLineageError: 422,
         }.get(type(exc), 400)
         return JSONResponse(status_code=status,
                             content={"error": exc.to_dict()})
@@ -125,6 +143,32 @@ def create_app(catalog: MetadataCatalog | None = None) -> FastAPI:
                max_depth: int | None = None):
         return analyze_impact(app.state.catalog, asset_id,
                               direction=direction, max_depth=max_depth).to_dict()
+
+    # ---- audit / reconstruction / batch ----------------------------------
+    @app.get("/lineage/audit/{asset_id}")
+    def lineage_audit(asset_id: str, start: float | None = None,
+                      end: float | None = None):
+        result = app.state.catalog.lineage_audit(asset_id, start, end)
+        return result.to_dict()
+
+    @app.get("/lineage/as-of")
+    def lineage_as_of(at: float):
+        return app.state.catalog.lineage_as_of(at).to_dict()
+
+    @app.get("/lineage/at-version/{asset_id}")
+    def lineage_at_version(asset_id: str, version: int):
+        return app.state.catalog.lineage_at_version(asset_id, version).to_dict()
+
+    @app.post("/lineage/batch")
+    def lineage_batch(payload: BatchLineageIn):
+        result = app.state.catalog.commit_lineage_batch(
+            [item.model_dump() for item in payload.changes])
+        return {
+            "batch_id": result["batch_id"],
+            "submitted": result["submitted"],
+            "applied": result["applied"],
+            "changes": [ch.to_dict() for ch in result["changes"]],
+        }
 
     @app.get("/")
     def root():

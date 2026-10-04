@@ -1,4 +1,5 @@
 """HTTP-level integration tests: endpoints, status codes and error codes."""
+import time
 import unittest
 
 from fastapi.testclient import TestClient
@@ -79,6 +80,60 @@ class ApiIntegrationTest(unittest.TestCase):
                  columns=[[x["name"] for x in v["columns"]] for v in versions])
         self.assertEqual([v["version"] for v in versions], [1, 2])
         self.assertEqual([x["name"] for x in versions[1]["columns"]], ["id", "email"])
+
+    def test_audit_reconstruction_and_batch_endpoints(self):
+        c = self.client
+        for aid in "abcd":
+            c.post("/assets", json={"asset_id": aid, "asset_type": "table",
+                                    "columns": [{"name": "id"}]})
+        # two single-edge registrations with distinct commit instants
+        first = c.post("/lineage", json={"upstream": "a", "downstream": "b"})
+        self.assertEqual(first.status_code, 200)
+        import time
+        time.sleep(0.01)  # guarantee distinct wall-clock readings
+        second = c.post("/lineage", json={"upstream": "b", "downstream": "c"})
+        self.assertEqual(second.status_code, 200)
+        audit_a = c.get("/lineage/audit/a").json()
+        t_first = audit_a["records"][0]["at"]
+        t_second = c.get("/lineage/audit/c").json()["records"][0]["at"]
+
+        # atomic batch (both changes share one commit instant)
+        batch = c.post("/lineage/batch", json={"changes": [
+            {"op": "add", "upstream": "c", "downstream": "d"},
+            {"op": "add", "upstream": "a", "downstream": "d"}]})
+        self.assertEqual(batch.status_code, 200, batch.text)
+        self.assertEqual(batch.json()["applied"], 2)
+        self.assertEqual(len({ch["at"] for ch in batch.json()["changes"]}), 1,
+                         "reason: one batch commits at one instant")
+
+        # batch with a bad relation -> 422 with per-item failures, nothing applied
+        before = len(c.get("/lineage").json())
+        bad = c.post("/lineage/batch", json={"changes": [
+            {"op": "add", "upstream": "b", "downstream": "d"},
+            {"op": "add", "upstream": "a", "downstream": "ghost"}]})
+        log_case("batch rollback via HTTP", status=bad.status_code,
+                 failures=bad.json()["error"]["failures"])
+        self.assertEqual(bad.status_code, 422)
+        self.assertEqual([f["index"] for f in bad.json()["error"]["failures"]], [1])
+        self.assertEqual(len(c.get("/lineage").json()), before,
+                         "reason: rolled-back batch must not add the valid edge")
+
+        # audit: unknown vs existing-without-changes stay distinguishable
+        self.assertEqual(c.get("/lineage/audit/ghost").status_code, 404)
+        found = c.get("/lineage/audit/a")
+        self.assertEqual(found.json()["status"], "found_changes")
+
+        # reconstruction: one edge at the first instant, two at the second
+        snap1 = c.get("/lineage/as-of", params={"at": t_first})
+        log_case("as-of HTTP", at=t_first, body=snap1.json())
+        self.assertEqual(snap1.json()["edge_count"], 1)
+        self.assertEqual(c.get("/lineage/as-of",
+                               params={"at": t_second}).json()["edge_count"], 2)
+        self.assertEqual(c.get("/lineage/as-of",
+                               params={"at": t_first - 100}).status_code, 422)
+        # per-version reconstruction (d v1 existed before any lineage touched it)
+        atv = c.get("/lineage/at-version/d", params={"version": 1})
+        self.assertEqual(atv.json()["edge_count"], 0)
 
 
 if __name__ == "__main__":
