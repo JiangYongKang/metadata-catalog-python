@@ -15,6 +15,7 @@ from .errors import (
     ConcurrentUpdateError,
     InvalidTimePointError,
     LineageCycleError,
+    SelfDependencyError,
     TimePointOutOfRangeError,
 )
 from .models import (
@@ -221,14 +222,21 @@ class MetadataCatalog:
     def _find_path(self, src: str, dst: str,
                    edge_objs: dict[tuple, LineageEdge] | None = None) -> list[str]:
         """Deterministic DFS path from src to dst following edge direction
-        (downstream adjacency). Returns [] when no path exists."""
+        (downstream adjacency). Returns [] when no path exists.
+
+        Intra-asset column edges (both endpoints on the same asset, i.e. legal
+        a.x -> a.y relations) are deliberately excluded: they only connect two
+        columns inside one table and can never lie on an inter-asset path or a
+        genuine multi-asset cycle. Counting them would falsely report a legal
+        same-table column relation as closing a -> ... -> a (both for single
+        registration and for the simulated post-batch graph)."""
         objs = self._edge_objs if edge_objs is None else edge_objs
         stack: list[tuple[str, list[str]]] = [(src, [src])]
         seen = {src}
         while stack:
             node, path = stack.pop()
             nxt = sorted({e.downstream for e in objs.values()
-                          if e.upstream == node})
+                          if e.upstream == node and e.downstream != node})
             # reverse so alphabetical order is explored first
             for neighbor in reversed(nxt):
                 if neighbor == dst:
@@ -268,19 +276,49 @@ class MetadataCatalog:
             self._asset_seq_index.setdefault(edge.downstream, []).append(change.seq)
         return change
 
-    def _self_loop_rejected(self, upstream: str, downstream: str,
-                            upstream_column, downstream_column) -> bool:
-        """A dependency that winds back onto the exact same node:
+    @staticmethod
+    def _self_dependency_kind(upstream: str, downstream: str,
+                              upstream_column, downstream_column) -> str | None:
+        """Classify a dependency that winds back onto the same asset.
 
-        - asset edge a -> a;
-        - column edge on one asset where the two columns are also identical
-          (a.x -> a.x). A column edge between two *different* columns of the
-          same asset is not a self-loop at the node level."""
+        Returns None when the relation is not a self-dependency, otherwise
+        one of the SelfDependencyError kinds:
+
+        - asset_self:       whole asset -> itself with no columns (a -> a)
+        - column_self:      the exact same column -> itself (a.x -> a.x,
+                            including the mirror spelling where only one side
+                            names the same column)
+        - asset_own_column: whole asset -> one of its own columns in either
+                            direction (a -> a.x or a.x -> a)
+
+        An edge between two *different* columns of the same asset
+        (a.x -> a.y) is an intra-asset relation, not a self-dependency:
+        cycle detection at the asset level must ignore those edges.
+        """
         if upstream != downstream:
-            return False
+            return None
         if upstream_column is None and downstream_column is None:
-            return True
-        return (upstream_column or "") == (downstream_column or "")
+            return SelfDependencyError.KIND_ASSET_SELF
+        if upstream_column is None or downstream_column is None:
+            # exactly one side is column-qualified: the table winds into one
+            # of its own columns (in whichever direction)
+            return SelfDependencyError.KIND_ASSET_OWN_COLUMN
+        if upstream_column == downstream_column:
+            return SelfDependencyError.KIND_COLUMN_SELF
+        return None
+
+    @staticmethod
+    def _self_dependency_message(kind: str, asset: str,
+                                 upstream_column, downstream_column) -> str:
+        if kind == SelfDependencyError.KIND_ASSET_SELF:
+            return f"self-dependency rejected: asset {asset!r} -> itself"
+        if kind == SelfDependencyError.KIND_COLUMN_SELF:
+            col = upstream_column or downstream_column
+            return (f"self-dependency rejected: column {col!r} of asset "
+                    f"{asset!r} -> itself")
+        return (f"self-dependency rejected: whole asset {asset!r} winds into "
+                f"its own column "
+                f"{upstream_column if upstream_column is not None else downstream_column!r}")
 
     def add_lineage(self, upstream, downstream, upstream_column=None,
                     downstream_column=None) -> LineageEdge:
@@ -289,20 +327,28 @@ class MetadataCatalog:
         Rejects:
         - AssetNotFoundError: either endpoint asset is unknown (dangling ref)
         - ColumnNotFoundError: a referenced column does not exist
-        - LineageCycleError: the edge would close a cycle; cycle path attached
-          (this includes a -> a and a column depending on itself)
+        - SelfDependencyError (subclass of LineageCycleError): the relation
+          winds back onto the same asset -- whole asset -> itself
+          (kind='asset_self'), same column -> itself ('column_self'), or the
+          whole table winding into one of its own columns in either direction
+          ('asset_own_column')
+        - LineageCycleError: the edge would close a genuine multi-asset cycle;
+          the cycle path is attached
         Idempotent: re-adding the identical edge returns the stored edge and
         writes no audit record. Every actual registration appends an audit
         record carrying the before/after state.
         Column-level edges never overwrite asset-level or other column edges.
         """
         upstream, downstream = str(upstream), str(downstream)
-        if self._self_loop_rejected(upstream, downstream,
-                                    upstream_column, downstream_column):
-            raise LineageCycleError(
-                f"self-dependency rejected: {upstream!r} -> itself"
-                + (f" column {upstream_column!r}" if upstream_column else ""),
-                asset=upstream, cycle=[upstream, upstream])
+        kind = self._self_dependency_kind(upstream, downstream,
+                                          upstream_column, downstream_column)
+        if kind is not None:
+            raise SelfDependencyError(
+                self._self_dependency_message(kind, upstream,
+                                              upstream_column, downstream_column),
+                asset=upstream, kind=kind,
+                upstream_column=upstream_column,
+                downstream_column=downstream_column)
         with self._lock:
             self._validate_endpoint(upstream, upstream_column)
             self._validate_endpoint(downstream, downstream_column)
@@ -376,11 +422,14 @@ class MetadataCatalog:
 
     def _validate_batch_item(self, idx: int, op: BatchOp,
                              candidate: dict) -> BatchFailure | None:
-        """Validate one item against assets/columns, self-loops and cycles
-        as they would stand after the whole batch. Returns None when valid."""
-        def fail(code: str, message: str) -> BatchFailure:
+        """Validate one item against assets/columns, self-dependencies and
+        cycles as they would stand after the whole batch. Returns None when
+        valid. Single registration and batch use the exact same predicates,
+        so the two entry points can never disagree on the same relation."""
+        def fail(code: str, message: str, kind: str | None = None) -> BatchFailure:
             return BatchFailure(idx, code, message, op.upstream, op.downstream,
-                                op.upstream_column, op.downstream_column, op.op)
+                                op.upstream_column, op.downstream_column, op.op,
+                                kind)
 
         # endpoints (assets then columns)
         for endpoint, column in ((op.upstream, op.upstream_column),
@@ -394,17 +443,20 @@ class MetadataCatalog:
                             f"references unknown column {column!r} on asset "
                             f"{endpoint!r}")
 
-        # self-dependency (asset-level or identical-column column-level)
-        if self._self_loop_rejected(op.upstream, op.downstream,
-                                    op.upstream_column, op.downstream_column):
+        # self-dependency: same predicate, same kinds as single registration
+        kind = self._self_dependency_kind(op.upstream, op.downstream,
+                                          op.upstream_column, op.downstream_column)
+        if kind is not None:
             return fail("lineage_cycle",
-                        f"self-dependency rejected: {op.upstream!r} -> itself"
-                        + (f" column {op.upstream_column!r}"
-                           if op.upstream_column else ""))
+                        self._self_dependency_message(
+                            kind, op.upstream, op.upstream_column,
+                            op.downstream_column),
+                        kind=kind)
 
         # cycles only matter for genuinely new adds; check against the
-        # would-be post-batch graph (the edge itself can never lie on a
-        # downstream -> upstream simple path, so its placeholder is harmless)
+        # would-be post-batch graph. The path search ignores intra-asset
+        # edges (same-table column relations), so this item's own
+        # placeholder can never make a legal a.x -> a.y look cyclic.
         if op.op == LINEAGE_OP_ADD and op.edge_key() not in self._edge_objs:
             path = self._find_path(op.downstream, op.upstream, candidate)
             if path:
@@ -480,8 +532,6 @@ class MetadataCatalog:
     def _decode_key(k: tuple) -> tuple:
         upstream, downstream, uc, dc = k
         return (upstream, downstream, uc or None, dc or None)
-        with self._lock:
-            return [self._edge_objs[k] for k in sorted(self._edge_objs)]
 
     # ---- graph helpers ----------------------------------------------------
     def upstream_neighbors(self, node: str) -> list[str]:

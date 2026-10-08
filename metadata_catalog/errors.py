@@ -50,6 +50,43 @@ class LineageCycleError(CatalogError):
         return data
 
 
+class SelfDependencyError(LineageCycleError):
+    """A lineage edge that winds back onto the same asset.
+
+    Still code 'lineage_cycle' (and an HTTP 422, and caught by
+    ``except LineageCycleError``), but ``kind`` distinguishes the three
+    shapes that must be rejected separately:
+
+    - 'asset_self'           : whole asset -> itself (a -> a)
+    - 'column_self'          : one column -> itself (a.x -> a.x)
+    - 'asset_own_column'     : whole asset -> one of its own columns, in
+                               either direction (a -> a.x / a.x -> a)
+
+    An edge between two *different* columns of the same asset (a.x -> a.y)
+    is none of these and stays legal.
+    """
+
+    KIND_ASSET_SELF = "asset_self"
+    KIND_COLUMN_SELF = "column_self"
+    KIND_ASSET_OWN_COLUMN = "asset_own_column"
+
+    def __init__(self, message: str = "", *, asset: str | None = None,
+                 kind: str, upstream_column: str | None = None,
+                 downstream_column: str | None = None):
+        super().__init__(message, asset=asset, cycle=[asset, asset]
+                         if asset is not None else [])
+        self.kind = kind
+        self.upstream_column = upstream_column
+        self.downstream_column = downstream_column
+
+    def to_dict(self) -> dict:
+        data = super().to_dict()
+        data["kind"] = self.kind
+        data["upstream_column"] = self.upstream_column
+        data["downstream_column"] = self.downstream_column
+        return data
+
+
 class ConcurrentUpdateError(CatalogError):
     code = "concurrent_update"
 
@@ -115,12 +152,17 @@ class BatchFailure:
     upstream_column: str | None = None
     downstream_column: str | None = None
     operation: str = "add"
+    # for lineage_cycle failures, the self-dependency shape:
+    # 'asset_self' / 'column_self' / 'asset_own_column'; None for genuine
+    # multi-node cycles and for non-cycle failures.
+    kind: str | None = None
 
     def to_dict(self) -> dict:
         return {
             "index": self.index,
             "operation": self.operation,
             "code": self.code,
+            "kind": self.kind,
             "message": self.message,
             "upstream": self.upstream,
             "downstream": self.downstream,

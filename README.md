@@ -45,15 +45,34 @@
 | --- | --- | --- | --- | --- |
 | `AssetNotFoundError` | `asset_not_found` | 404 | 血缘端点、审计/影响分析起点指向未知资产 | `asset` |
 | `ColumnNotFoundError` | `column_not_found` | 404 | 列级血缘引用了该资产上不存在的列 | `asset`, `column` |
-| `LineageCycleError` | `lineage_cycle` | 422 | 新边会成环（含资产自依赖 a→a、列自依赖 a.x→a.x；同一资产两列之间 a.x→a.y 不算自环） | `cycle`（检测到的环路径） |
+| `SelfDependencyError`（`LineageCycleError` 的子类） | `lineage_cycle` | 422 | 依赖绕回同一资产：整表→整表、同一列→同一列、整表↔本表某一列（任一方向） | `cycle`、`kind`（区分三种形状，见下）、两侧列名 |
+| `LineageCycleError` | `lineage_cycle` | 422 | 新边会闭合一个**跨资产**的环（a→b→…→a）；同一张表两个不同列之间 a.x→a.y 不是环 | `cycle`（检测到的环路径） |
 | `ConcurrentUpdateError` | `concurrent_update` | 409 | 乐观锁版本不匹配 | `expected_version`, `actual_version`（资产不存在时 actual=0） |
 | `InvalidTimePointError` | `invalid_time_point` | 400 | 回溯/审计的时间参数本身不合法（非数字、NaN、无穷、start>end） | `value` |
 | `TimePointOutOfRangeError` | `time_point_out_of_range` | 422 | 时间合法但落在可还原窗口之外（早于首条变更/晚于最新状态） | `requested`, `earliest`, `latest` |
-| `BatchLineageError` | `batch_lineage_rejected` | 422 | 批次中存在坏关系，整批拒绝 | `failures`（逐条 `index`/`code`/`message`/边四元组） |
+| `BatchLineageError` | `batch_lineage_rejected` | 422 | 批次中存在坏关系，整批拒绝 | `failures`（逐条 `index`/`code`/`kind`/`message`/边四元组） |
 
-环检测：加入 `u -> v` 前，先检查当前图上是否存在 `v → ... → u` 的有向路径；
-存在则拒绝并返回该路径（加上闭环边）。菱形上的“快捷边”（如 `a -> d` 与
-`a->b->d` 共存）**不是环**，允许登记。
+### 自依赖判定（三种形状，全部当场拒绝，报错可区分）
+
+血缘登记在任何成环检测之前先做自依赖判定，同一资产 `upstream == downstream` 时按列参数分三种
+**互相区分**的形状，错误类型统一是 `SelfDependencyError`（仍是 `lineage_cycle` / HTTP 422，
+`except LineageCycleError` 依然能捕获），靠 `kind` 字段区分：
+
+| 形状 | 例子 | `kind` |
+| --- | --- | --- |
+| 整张表指向自己（两端都不带列） | `a -> a` | `asset_self` |
+| 同一列指向自己（两端列名相同） | `a.id -> a.id` | `column_self` |
+| 整张表与自己的某一列互相绕回（只有一侧带列，两个方向都算） | `a -> a.id`、`a.id -> a` | `asset_own_column` |
+
+**同一张表内两个不同列之间的关系不是自依赖、也不是环**：`a.id -> a.v`、`a.v -> a.x`
+一律允许，并且可以连续登记多条、与跨资产关系共存。
+
+环检测：加入 `u -> v` 前，先在**资产级图**上检查是否存在 `v → ... → u` 的有向路径；
+存在则拒绝并返回该路径（加上闭环边）。资产级路径**只走跨资产的边**——同表列间边
+（`a.x -> a.y`）两端是同一个资产，不可能出现在任何跨资产路径或真正的多资产环上，
+因此环检测显式忽略它们（否则一条合法的同表列间关系会被误报成 `a -> ... -> a` 的环，
+并连带污染之后所有同表列间关系的判定）。菱形上的“快捷边”（如 `a -> d` 与 `a->b->d`
+共存）**不是环**，允许登记。
 
 ## 2. 影响分析规则
 
@@ -127,14 +146,26 @@
 `catalog.commit_lineage_batch([...])`：一次提交一批 add/remove（接受 `BatchOp`
 或 dict 列表），**要么全部生效、要么一条都不生效**：
 
-1. 先在锁内模拟出“整批提交后”的候选图；
-2. **逐条校验**：未知资产（`asset_not_found`）、未知列（`column_not_found`）、
-   依赖绕回自己（资产级 a→a，或列级 a.x→a.x）、以及对候选图做环检测
-   （`lineage_cycle`，含同一批次内新增边之间形成的环，如本批先加 d→a 再加 a→d）；
+1. 先在锁内模拟出“整批提交后”的候选图（本批的 add 先放占位、remove 先剔除）；
+2. **逐条校验**，且每条用的就是与单条登记 `add_lineage` **完全相同的判定谓词**：
+   未知资产（`asset_not_found`）、未知列（`column_not_found`）、自依赖三种形状
+   （`lineage_cycle` + `kind=asset_self/column_self/asset_own_column`）、以及对候选
+   图做**资产级**环检测（`lineage_cycle`，含同一批次内新增边之间形成的环，如本批先加
+   d→a 再加 a→d）；
 3. 只要有一条不过，抛 `BatchLineageError`，`failures` 里**逐条**给出
-   `index / code / message / 边四元组`，图保持字节级不变；
+   `index / code / kind / message / 边四元组`，图保持字节级不变；
 4. 全部通过后按输入顺序应用，整批共享一个提交时间戳与 `batch_id`，每条实际
    变更各有独立 `seq`；幂等项（重复 add / 删除缺失边）合法但不产生变更。
+
+**单条登记与批量提交对同一条关系必须给出相同结论**：两个入口共用同一套自依赖分类与
+同一个资产级环检测（路径搜索忽略同表列间边），因此不会再出现“单独登记
+`a.id -> a.v` 能过、放进批次却被判成环整批拒绝”的分叉；回归用例
+`test_single_and_batch_agree_on_every_relation` 对整张关系矩阵（三种自依赖形状 +
+同表不同列 + 跨资产列级/资产级）逐对拍两个入口的结论（接受/拒绝、code、kind）。
+
+**图在任何时刻都自洽**：被挡下的单条登记不改动图、不写审计；被拒批次一条都不生效
+（校验阶段只操作候选图副本）；一条已写入的合法同表列间关系也不会让其它合法关系被误判
+（环检测根本不沿同表列间边行走）。
 
 并发：批次的“校验 + 应用”全程在同一把写锁内原子完成——多批次并发提交不丢改动，
 边提交边查询也读不到只改了一半的图（读路径持同一把锁，拿到的永远是整批前或整批后
@@ -196,7 +227,12 @@ python3 -m unittest tests.test_lineage tests.test_impact tests.test_concurrency 
 测试覆盖（每个失败断言均带有 `reason:`，日志中打印关键输入）：
 
 - `tests/test_lineage.py`：悬空资产引用、悬空列引用（错误码区分）、自依赖、
-  三环路径与回显、菱形快捷边不误判、列级边独立性、拒绝后无部分写入。
+  三环路径与回显、菱形快捷边不误判、列级边独立性、拒绝后无部分写入；
+  **自依赖回归 `SelfDependencyShapeTest`：三种形状（`asset_self` /
+  `column_self` / `asset_own_column`，含整表↔本表列的两个方向）各自被当场
+  挡下且 `kind` 可区分、报错不动图；同表不同列 `a.id→a.v` 等多条连续登记
+  合法且幂等；被拒的自依赖不留下“污染”后续关系的残影；已有同表列间边时
+  真正的跨资产环仍然报得出。**
 - `tests/test_impact.py`：上下游方向、最小深度、`max_depth` 截断边界、
   菱形重复路径、1000 条并行路径不膨胀、30 次运行确定性、含环图终止性。
 - `tests/test_concurrency.py`：幂等不产生版本、合并不丢列与血缘、历史快照
@@ -213,18 +249,36 @@ python3 -m unittest tests.test_lineage tests.test_impact tests.test_concurrency 
 - `tests/test_batch.py`（新）：**批次混入一条坏关系整批回滚**（含合法边不落库）、
   多条坏关系逐条列出 index+原因（未知资产/未知列/列自依赖/成环）、同批次内
   互相成环被挡、增删混合整体提交且共享 `batch_id`、**16 线程并发批次无丢失**、
-  边提交边读取永不出现“半批”图。
+  边提交边读取永不出现“半批”图；
+  **自依赖与单/批一致性回归 `BatchSelfDependencyParityTest`：三种自依赖
+  形状在批次里同样逐条带 `kind` 被挡且整批不生效；同表不同列关系（单条、
+  混入多条批次、已有一条之后再登记）均合法；关系矩阵逐对拍单条登记与批量
+  提交的结论（接受与否、`code`、`kind` 完全一致）。**
+  并发读用例已修正为**真正运行**：读线程把任何异常回收并在主线程断言失败
+  （此前对 `LineageEdge` 对象直接解包会让读线程首轮就抛 `TypeError` 退出，
+  用例却照样通过，等于没验）；日志打印总读数、与在途提交交叠的读数
+  （`reads_..._in_flight`，证明非空覆盖）、半批观察数（必须为 0）、最终边数；
+  另加 16 写者 × 25 轮重复提交的压力用例，持续验证“整批前/整批后”不变量。
 - `tests/test_api.py`：HTTP 全链路状态码与错误码区分、版本端点、深度参数，
-  以及新审计/回溯/批量端点与整批回滚（422 + 逐条 failures）。
+  新审计/回溯/批量端点与整批回滚（422 + 逐条 failures），以及**三种自依赖
+  形状经 HTTP 均为 422 且回带 `kind`、同表不同列关系经单条与批量端点均
+  200、批次自依赖失败带 `kind` 且不生效**。
 
 ## 9. 与原有用法的兼容范围
 
 - 完全向后兼容：`register_asset` / `add_lineage` / `remove_lineage` /
   `list_lineage` / `analyze_impact` / 版本与 CAS 接口签名与行为均保持不变；
   审计、回溯、批量均为**新增能力**，原有 HTTP 端点与错误结构不变。
-- 一处收紧：列级“同资产同列”自依赖 `a.x -> a.x` 现在与 `a -> a` 一样按
-  `lineage_cycle` 拒绝（此前仅资产级自依赖被挡）；同资产不同列 `a.x -> a.y`
-  仍允许。重复登记、删除不存在边仍为幂等无审计。
+- 自依赖判定收紧（仍是 HTTP 422 / `code=lineage_cycle`，老的 `except
+  LineageCycleError` 捕获方式不变）：除资产级 `a -> a`、同列自环 `a.x -> a.x`
+  外，**整张表与本表某一列的绕回**（`a -> a.id` 与 `a.id -> a`，即只有一侧带列
+  的同资产关系）此前会被直接写进图里，现在与前两种一样当场拒绝；三种形状以
+  `SelfDependencyError` 抛出并带可区分的 `kind`（`asset_self` / `column_self`
+  / `asset_own_column`），批次失败项里也带同一 `kind`。
+- 同资产**不同列**之间 `a.x -> a.y` 始终允许：既不会被单条登记挡下，也不会被
+  批量提交当成环，更不会因为已存在一条而同其余合法关系互相误判——环检测只沿
+  跨资产的边行走。
+- 重复登记、删除不存在边仍为幂等无审计。
 - 时钟可注入（`MetadataCatalog(clock=...)`）便于对拍与确定性测试；默认走墙钟，
   同一进程内做严格递增保护，不影响默认部署。
 - 存储仍是进程内内存结构，审计与检查点同处内存，无需任何外部服务。
@@ -235,7 +289,8 @@ python3 -m unittest tests.test_lineage tests.test_impact tests.test_concurrency 
 metadata_catalog/
   models.py    # Column / LineageEdge / AssetVersion / Asset 领域模型，
                # 以及 BatchOp / LineageChange / LineageAuditResult
-  errors.py    # 可区分错误（稳定 code + 诊断字段），含时间与批次错误、BatchFailure
+  errors.py    # 可区分错误（稳定 code + 诊断字段），含 SelfDependencyError
+               # （三种自依赖 kind）、时间与批次错误、BatchFailure
   catalog.py   # 登记、幂等合并、血缘校验与环检测、邻接查询、
                # 追加式审计、时点重放（惰性检查点）、原子批量提交
   history.py   # HistoricalLineageView：不可变历史快照（可直接跑 analyze_impact）

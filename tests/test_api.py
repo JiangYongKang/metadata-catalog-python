@@ -135,6 +135,50 @@ class ApiIntegrationTest(unittest.TestCase):
         atv = c.get("/lineage/at-version/d", params={"version": 1})
         self.assertEqual(atv.json()["edge_count"], 0)
 
+    def test_self_dependency_kinds_and_intra_asset_columns_via_http(self):
+        c = self.client
+        c.post("/assets", json={"asset_id": "a", "asset_type": "table",
+                                "columns": [{"name": "id"}, {"name": "v"}]})
+
+        shapes = [
+            ("a->a", {}, "asset_self"),
+            ("a.id->a.id", {"upstream_column": "id",
+                            "downstream_column": "id"}, "column_self"),
+            ("a->a.id", {"downstream_column": "id"}, "asset_own_column"),
+            ("a.id->a", {"upstream_column": "id"}, "asset_own_column"),
+        ]
+        for label, extra, kind in shapes:
+            resp = c.post("/lineage",
+                          json={"upstream": "a", "downstream": "a", **extra})
+            log_case("HTTP self-dependency", relation=label,
+                     status=resp.status_code,
+                     error=resp.json()["error"])
+            self.assertEqual(resp.status_code, 422)
+            self.assertEqual(resp.json()["error"]["code"], "lineage_cycle")
+            self.assertEqual(resp.json()["error"]["kind"], kind)
+
+        # legal same-table different-column relation: single and batch
+        ok_single = c.post("/lineage", json={
+            "upstream": "a", "downstream": "a",
+            "upstream_column": "id", "downstream_column": "v"})
+        self.assertEqual(ok_single.status_code, 200, ok_single.text)
+        ok_batch = c.post("/lineage/batch", json={"changes": [
+            {"upstream": "a", "downstream": "a",
+             "upstream_column": "v", "downstream_column": "id"}]})
+        self.assertEqual(ok_batch.status_code, 200, ok_batch.text)
+        self.assertEqual(ok_batch.json()["applied"], 1)
+
+        # batch self-dependency failure carries the kind and applies nothing
+        before = len(c.get("/lineage").json())
+        bad = c.post("/lineage/batch", json={"changes": [
+            {"upstream": "a", "downstream": "a", "upstream_column": "id"}]})
+        self.assertEqual(bad.status_code, 422)
+        f = bad.json()["error"]["failures"][0]
+        log_case("HTTP batch self-dependency", kind=f["kind"], code=f["code"])
+        self.assertEqual((f["code"], f["kind"]),
+                         ("lineage_cycle", "asset_own_column"))
+        self.assertEqual(len(c.get("/lineage").json()), before)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
