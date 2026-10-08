@@ -50,6 +50,35 @@ class LineageCycleError(CatalogError):
         return data
 
 
+class SelfLineageError(LineageCycleError):
+    """A dependency that winds back onto the same asset itself.
+
+    Distinct from a generic multi-asset cycle (``lineage_cycle``): the edge
+    alone is already illegal, regardless of the rest of the graph. ``kind``
+    says which shape it took:
+
+    - ``asset``:           whole asset -> itself (a -> a);
+    - ``column``:          a column -> the very same column (a.x -> a.x);
+    - ``asset_to_column``: whole asset -> one of its own columns (a -> a.x);
+    - ``column_to_asset``: a column -> its own asset (a.x -> a).
+
+    Two *different* columns of the same asset (a.x -> a.y) are NOT a
+    self-dependency and remain legal.
+    """
+    code = "self_dependency"
+
+    def __init__(self, message: str = "", *, asset: str | None = None,
+                 cycle: list[str] | None = None, kind: str | None = None):
+        super().__init__(message, asset=asset, cycle=cycle)
+        self.kind = kind
+
+    def to_dict(self) -> dict:
+        data = super().to_dict()
+        if self.kind is not None:
+            data["kind"] = self.kind
+        return data
+
+
 class ConcurrentUpdateError(CatalogError):
     code = "concurrent_update"
 

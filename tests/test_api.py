@@ -41,6 +41,49 @@ class ApiIntegrationTest(unittest.TestCase):
             self.assertEqual(resp.json()["error"]["code"], want_code,
                              f"reason[{title}]: wrong code in {resp.json()}")
 
+    def test_self_dependency_over_http_is_422_with_distinct_code(self):
+        c = self.client
+        c.post("/assets", json={"asset_id": "a", "asset_type": "table",
+                                "columns": [{"name": "x"}, {"name": "y"}]})
+        cases = [
+            ("table -> itself", {"upstream": "a", "downstream": "a"}, "asset"),
+            ("same column -> itself",
+             {"upstream": "a", "downstream": "a",
+              "upstream_column": "x", "downstream_column": "x"}, "column"),
+            ("table -> own column",
+             {"upstream": "a", "downstream": "a",
+              "downstream_column": "x"}, "asset_to_column"),
+            ("column -> own table",
+             {"upstream": "a", "downstream": "a",
+              "upstream_column": "x"}, "column_to_asset"),
+        ]
+        for title, payload, want_kind in cases:
+            resp = c.post("/lineage", json=payload)
+            log_case(title, status=resp.status_code, body=resp.json())
+            self.assertEqual(resp.status_code, 422,
+                             f"reason[{title}]: self-dependency must be 422")
+            err = resp.json()["error"]
+            self.assertEqual(err["code"], "self_dependency",
+                             f"reason[{title}]: code must be distinguishable "
+                             f"from lineage_cycle")
+            self.assertEqual(err["kind"], want_kind)
+        # same table, two different columns stays legal over HTTP
+        ok = c.post("/lineage", json={"upstream": "a", "downstream": "a",
+                                      "upstream_column": "x",
+                                      "downstream_column": "y"})
+        log_case("intra-asset a.x -> a.y over HTTP", status=ok.status_code)
+        self.assertEqual(ok.status_code, 200,
+                         "reason: a.x -> a.y must not be rejected")
+        # and the batch entrance agrees with the single-entry one
+        bad_batch = c.post("/lineage/batch", json={"changes": [
+            {"op": "add", "upstream": "a", "downstream": "a",
+             "downstream_column": "x"}]})
+        self.assertEqual(bad_batch.status_code, 422)
+        failure = bad_batch.json()["error"]["failures"][0]
+        self.assertEqual(failure["code"], "self_dependency",
+                         "reason: batch and single entry must report the "
+                         "same code for the same relation")
+
     def test_conflict_is_409_with_versions(self):
         c = self.client
         c.post("/assets", json={"asset_id": "a", "asset_type": "table"})

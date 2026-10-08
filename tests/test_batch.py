@@ -57,7 +57,9 @@ class BatchLineageTest(unittest.TestCase):
         codes = {f.index: f.code for f in failures}
         self.assertEqual(codes[0], "asset_not_found")
         self.assertEqual(codes[1], "column_not_found")
-        self.assertEqual(codes[2], "lineage_cycle")
+        self.assertEqual(codes[2], "self_dependency",
+                         "reason: column self-loop must carry the "
+                         "distinguishable self_dependency code")
         self.assertEqual(codes[3], "lineage_cycle")
         self.assertEqual(len(self.catalog.list_lineage()), 1,
                          "reason: rejected batch leaves graph untouched")
@@ -143,35 +145,43 @@ class ConcurrentBatchTest(unittest.TestCase):
                          "reason: every batch must commit both edges exactly once")
 
     def test_reader_never_sees_a_half_applied_batch(self):
+        """While 16 writers each commit a 2-edge batch, a reader thread
+        continuously snapshots the graph: it must always observe either
+        both edges of a batch or neither, and no committed change may be
+        lost. Exceptions inside worker threads are collected and fail the
+        test -- a thread that dies silently can no longer fake a pass."""
         n = self.n_groups
         barrier = threading.Barrier(n + 1)
         stop = threading.Event()
         torn: list[tuple] = []
+        thread_errors: list[str] = []
         checked = {"reads": 0}
 
         def submit_group(i: int):
             g = f"g{i:02d}"
-            barrier.wait()
-            while not stop.is_set():
-                try:
-                    self.catalog.commit_lineage_batch([
-                        {"op": "add", "upstream": "h", "downstream": g},
-                        {"op": "add", "upstream": g, "downstream": "s"},
-                    ])
-                    return
-                except Exception:  # pragma: no cover - defensive
-                    pass
+            try:
+                barrier.wait()
+                self.catalog.commit_lineage_batch([
+                    {"op": "add", "upstream": "h", "downstream": g},
+                    {"op": "add", "upstream": g, "downstream": "s"},
+                ])
+            except Exception as exc:  # noqa: BLE001 - any failure here is a real bug
+                thread_errors.append(f"writer {g}: {exc!r}")
 
         def reader():
-            while not stop.is_set():
-                edges = self.catalog.list_lineage()
-                pairs = {(u, v) for u, v, _, _ in edges}
-                checked["reads"] += 1
-                for i in range(n):
-                    g = f"g{i:02d}"
-                    only_one = (("h", g) in pairs) != ((g, "s") in pairs)
-                    if only_one:
-                        torn.append((g, sorted(pairs)))
+            try:
+                barrier.wait()
+                while not stop.is_set():
+                    edges = self.catalog.list_lineage()
+                    pairs = {(e.upstream, e.downstream) for e in edges}
+                    checked["reads"] += 1
+                    for i in range(n):
+                        g = f"g{i:02d}"
+                        only_one = (("h", g) in pairs) != ((g, "s") in pairs)
+                        if only_one:
+                            torn.append((g, sorted(pairs)))
+            except Exception as exc:  # noqa: BLE001 - a dying reader must not go unnoticed
+                thread_errors.append(f"reader: {exc!r}")
 
         writers = [threading.Thread(target=submit_group, args=(i,))
                    for i in range(n)]
@@ -179,16 +189,32 @@ class ConcurrentBatchTest(unittest.TestCase):
         for t in writers:
             t.start()
         rthread.start()
-        barrier.wait()
         for t in writers:
             t.join()
         stop.set()
         rthread.join()
-        log_case("read/write race", reads=checked["reads"],
-                 torn_observations=len(torn))
+
+        final_pairs = {(e.upstream, e.downstream)
+                       for e in self.catalog.list_lineage()}
+        log_case("read/write race", writers=n, reads=checked["reads"],
+                 torn_observations=len(torn),
+                 thread_errors=thread_errors or "none",
+                 final_edge_count=len(final_pairs))
+        self.assertEqual(thread_errors, [],
+                         "reason: no worker thread may die with an exception")
+        self.assertGreater(checked["reads"], 0,
+                           "reason: the reader must actually have run")
         self.assertEqual(torn, [],
                          "reason: a reader saw exactly one edge of a 2-edge batch")
-        self.assertGreater(checked["reads"], 0)
+        for i in range(n):
+            g = f"g{i:02d}"
+            self.assertIn(("h", g), final_pairs,
+                          f"reason: edge h->{g} lost under concurrency")
+            self.assertIn((g, "s"), final_pairs,
+                          f"reason: edge {g}->s lost under concurrency")
+        self.assertEqual(len(final_pairs), 2 * n,
+                         "reason: every concurrent batch must commit both "
+                         "edges exactly once")
 
 
 if __name__ == "__main__":

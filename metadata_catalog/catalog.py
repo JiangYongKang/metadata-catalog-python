@@ -15,6 +15,7 @@ from .errors import (
     ConcurrentUpdateError,
     InvalidTimePointError,
     LineageCycleError,
+    SelfLineageError,
     TimePointOutOfRangeError,
 )
 from .models import (
@@ -221,14 +222,20 @@ class MetadataCatalog:
     def _find_path(self, src: str, dst: str,
                    edge_objs: dict[tuple, LineageEdge] | None = None) -> list[str]:
         """Deterministic DFS path from src to dst following edge direction
-        (downstream adjacency). Returns [] when no path exists."""
+        (downstream adjacency). Returns [] when no path exists.
+
+        Edges whose two endpoints are the same asset (intra-asset column
+        edges, or legacy self-referencing rows) are skipped: a self-loop can
+        never lie on a simple path between two nodes, so it must neither
+        open nor close a cycle. This keeps one stray self-referencing edge
+        from poisoning cycle checks for unrelated, legitimate relations."""
         objs = self._edge_objs if edge_objs is None else edge_objs
         stack: list[tuple[str, list[str]]] = [(src, [src])]
         seen = {src}
         while stack:
             node, path = stack.pop()
             nxt = sorted({e.downstream for e in objs.values()
-                          if e.upstream == node})
+                          if e.upstream == node and e.downstream != node})
             # reverse so alphabetical order is explored first
             for neighbor in reversed(nxt):
                 if neighbor == dst:
@@ -268,19 +275,44 @@ class MetadataCatalog:
             self._asset_seq_index.setdefault(edge.downstream, []).append(change.seq)
         return change
 
-    def _self_loop_rejected(self, upstream: str, downstream: str,
-                            upstream_column, downstream_column) -> bool:
-        """A dependency that winds back onto the exact same node:
+    @staticmethod
+    def _self_dependency_kind(upstream: str, downstream: str,
+                              upstream_column, downstream_column) -> str | None:
+        """Classify a dependency that winds back onto the same asset.
 
-        - asset edge a -> a;
-        - column edge on one asset where the two columns are also identical
-          (a.x -> a.x). A column edge between two *different* columns of the
-          same asset is not a self-loop at the node level."""
+        Returns None when the relation is legitimate (different assets, or
+        two *different* columns of one asset, a.x -> a.y). Otherwise returns
+        the self-dependency shape:
+
+        - ``asset``:           a -> a (whole asset onto itself);
+        - ``column``:          a.x -> a.x (a column onto itself);
+        - ``asset_to_column``: a -> a.x (whole asset onto its own column);
+        - ``column_to_asset``: a.x -> a (a column onto its own asset).
+        """
         if upstream != downstream:
-            return False
+            return None
         if upstream_column is None and downstream_column is None:
-            return True
-        return (upstream_column or "") == (downstream_column or "")
+            return "asset"
+        if upstream_column is not None and downstream_column is not None:
+            if upstream_column != downstream_column:
+                return None  # a.x -> a.y: legal intra-asset dependency
+            return "column"
+        return "asset_to_column" if downstream_column is not None \
+            else "column_to_asset"
+
+    @staticmethod
+    def _self_dependency_message(kind: str, asset: str,
+                                 upstream_column, downstream_column) -> str:
+        if kind == "asset":
+            return f"self-dependency rejected: asset {asset!r} -> itself"
+        if kind == "column":
+            return (f"self-dependency rejected: column {upstream_column!r} "
+                    f"of asset {asset!r} -> itself")
+        if kind == "asset_to_column":
+            return (f"self-dependency rejected: asset {asset!r} -> its own "
+                    f"column {downstream_column!r}")
+        return (f"self-dependency rejected: column {upstream_column!r} of "
+                f"asset {asset!r} -> the asset itself")
 
     def add_lineage(self, upstream, downstream, upstream_column=None,
                     downstream_column=None) -> LineageEdge:
@@ -289,32 +321,40 @@ class MetadataCatalog:
         Rejects:
         - AssetNotFoundError: either endpoint asset is unknown (dangling ref)
         - ColumnNotFoundError: a referenced column does not exist
-        - LineageCycleError: the edge would close a cycle; cycle path attached
-          (this includes a -> a and a column depending on itself)
+        - SelfLineageError (code 'self_dependency'): the relation winds back
+          onto the same asset -- a -> a, a.x -> a.x, a -> a.x or a.x -> a.
+          (Two different columns of one asset, a.x -> a.y, stay legal.)
+        - LineageCycleError: the edge would close a multi-asset cycle; cycle
+          path attached
         Idempotent: re-adding the identical edge returns the stored edge and
         writes no audit record. Every actual registration appends an audit
         record carrying the before/after state.
         Column-level edges never overwrite asset-level or other column edges.
         """
         upstream, downstream = str(upstream), str(downstream)
-        if self._self_loop_rejected(upstream, downstream,
-                                    upstream_column, downstream_column):
-            raise LineageCycleError(
-                f"self-dependency rejected: {upstream!r} -> itself"
-                + (f" column {upstream_column!r}" if upstream_column else ""),
-                asset=upstream, cycle=[upstream, upstream])
+        kind = self._self_dependency_kind(upstream, downstream,
+                                          upstream_column, downstream_column)
+        if kind is not None:
+            raise SelfLineageError(
+                self._self_dependency_message(kind, upstream,
+                                              upstream_column,
+                                              downstream_column),
+                asset=upstream, cycle=[upstream, upstream], kind=kind)
         with self._lock:
             self._validate_endpoint(upstream, upstream_column)
             self._validate_endpoint(downstream, downstream_column)
 
             # Would this edge make downstream reachable ... -> upstream?
-            path = self._find_path(downstream, upstream)
-            if path:
-                cycle = path + [downstream]
-                raise LineageCycleError(
-                    f"cycle rejected: adding {upstream!r} -> {downstream!r} "
-                    f"would close cycle {' -> '.join(cycle)}",
-                    asset=downstream, cycle=cycle)
+            # An intra-asset column edge (a.x -> a.y) can never close an
+            # asset-level cycle, so the path search is skipped for it.
+            if upstream != downstream:
+                path = self._find_path(downstream, upstream)
+                if path:
+                    cycle = path + [downstream]
+                    raise LineageCycleError(
+                        f"cycle rejected: adding {upstream!r} -> {downstream!r} "
+                        f"would close cycle {' -> '.join(cycle)}",
+                        asset=downstream, cycle=cycle)
 
             edge = LineageEdge(upstream, downstream, upstream_column,
                                downstream_column, registered_at=self._now())
@@ -394,18 +434,23 @@ class MetadataCatalog:
                             f"references unknown column {column!r} on asset "
                             f"{endpoint!r}")
 
-        # self-dependency (asset-level or identical-column column-level)
-        if self._self_loop_rejected(op.upstream, op.downstream,
-                                    op.upstream_column, op.downstream_column):
-            return fail("lineage_cycle",
-                        f"self-dependency rejected: {op.upstream!r} -> itself"
-                        + (f" column {op.upstream_column!r}"
-                           if op.upstream_column else ""))
+        # self-dependency: same classification and same code as add_lineage,
+        # so single registration and batch commit always agree
+        kind = self._self_dependency_kind(op.upstream, op.downstream,
+                                          op.upstream_column,
+                                          op.downstream_column)
+        if kind is not None:
+            return fail("self_dependency",
+                        self._self_dependency_message(kind, op.upstream,
+                                                      op.upstream_column,
+                                                      op.downstream_column))
 
         # cycles only matter for genuinely new adds; check against the
-        # would-be post-batch graph (the edge itself can never lie on a
-        # downstream -> upstream simple path, so its placeholder is harmless)
-        if op.op == LINEAGE_OP_ADD and op.edge_key() not in self._edge_objs:
+        # would-be post-batch graph. An intra-asset edge (a.x -> a.y) can
+        # never close an asset-level cycle, so it skips the search entirely
+        # -- exactly like add_lineage does.
+        if (op.op == LINEAGE_OP_ADD and op.upstream != op.downstream
+                and op.edge_key() not in self._edge_objs):
             path = self._find_path(op.downstream, op.upstream, candidate)
             if path:
                 cycle = path + [op.downstream]
@@ -417,8 +462,10 @@ class MetadataCatalog:
         """Atomically apply a batch of edge additions/removals.
 
         All-or-nothing: every item is validated first (unknown asset/column,
-        self-dependency including a column depending on itself, and cycles
-        against the would-be post-batch graph). If anything is wrong the
+        self-dependency in any of the four shapes a->a / a.x->a.x / a->a.x /
+        a.x->a -- reported as 'self_dependency', the same classification and
+        code add_lineage uses -- and cycles against the would-be post-batch
+        graph). If anything is wrong the
         whole batch is rejected with BatchLineageError listing each offending
         item with its index and reason, and the graph is left byte-for-byte
         unchanged. Idempotent items (adding an existing edge / removing a

@@ -9,6 +9,7 @@ from .errors import (
     ConcurrentUpdateError,
     InvalidTimePointError,
     LineageCycleError,
+    SelfLineageError,
     TimePointOutOfRangeError,
 )
 from .history import HistoricalLineageView
@@ -28,6 +29,7 @@ __all__ = [
     "analyze_impact", "Asset", "AssetVersion", "Column", "LineageEdge",
     "BatchOp", "LineageChange", "LineageAuditResult",
     "CatalogError", "AssetNotFoundError", "ColumnNotFoundError",
-    "LineageCycleError", "ConcurrentUpdateError", "InvalidTimePointError",
+    "LineageCycleError", "SelfLineageError", "ConcurrentUpdateError",
+    "InvalidTimePointError",
     "TimePointOutOfRangeError", "BatchLineageError", "BatchFailure",
 ]

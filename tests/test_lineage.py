@@ -51,12 +51,17 @@ class LineageValidationTest(unittest.TestCase):
         self.assertEqual(err.column, "missing")
 
     def test_self_dependency_is_a_cycle(self):
-        """a -> a is an immediate cycle."""
+        """a -> a is rejected on the spot with the distinguishable
+        self_dependency code (a specialised LineageCycleError)."""
         log_case("self dependency", edge=("a", "a"))
         with self.assertRaises(LineageCycleError) as ctx:
             self.catalog.add_lineage("a", "a")
-        self.assertEqual(ctx.exception.code, "lineage_cycle")
-        self.assertIn("a", ctx.exception.cycle)
+        err = ctx.exception
+        self.assertEqual(err.code, "self_dependency",
+                         f"reason: self-dependency must be distinguishable "
+                         f"from a multi-asset cycle, got {err.code}")
+        self.assertEqual(err.kind, "asset")
+        self.assertIn("a", err.cycle)
 
     def test_three_node_cycle_rejected_with_path(self):
         """a->b, b->c accepted; c->a rejected; cycle path must be reported."""

@@ -14,6 +14,7 @@ from .errors import (
     ConcurrentUpdateError,
     InvalidTimePointError,
     LineageCycleError,
+    SelfLineageError,
     TimePointOutOfRangeError,
 )
 from .impact import analyze_impact
@@ -78,6 +79,7 @@ def create_app(catalog: MetadataCatalog | None = None) -> FastAPI:
             AssetNotFoundError: 404,
             ColumnNotFoundError: 404,
             LineageCycleError: 422,
+            SelfLineageError: 422,
             ConcurrentUpdateError: 409,
             InvalidTimePointError: 400,
             TimePointOutOfRangeError: 422,
